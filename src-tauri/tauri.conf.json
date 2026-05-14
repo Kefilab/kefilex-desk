@@ -1,0 +1,72 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/schema.json",
+  "productName": "Kefilex Desk",
+  "version": "0.1.0",
+  "identifier": "com.kefilab.desk",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Kefilex Desk",
+        "label": "main",
+        "width": 480,
+        "height": 560,
+        "resizable": false,
+        "fullscreen": false,
+        "decorations": true,
+        "visible": false,
+        "skipTaskbar": true,
+        "center": true
+      }
+    ],
+    "trayIcon": {
+      "id": "main",
+      "iconPath": "icons/tray.png",
+      "iconAsTemplate": false,
+      "tooltip": "Kefilex Desk",
+      "menuOnLeftClick": false
+    },
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["msi"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "publisher": "Kefilab Ltd.",
+    "copyright": "Copyright (c) 2026 Kefilab Ltd.",
+    "category": "Productivity",
+    "shortDescription": "Live call capture for Kefilex Reception",
+    "longDescription": "Watches OS notifications from any softphone (VXT, RingCentral, Aircall, Microsoft Teams, Zoom Phone, Dialpad, 8x8, Cisco Webex Calling) and reports incoming calls to the Kefilex Reception inbox in real time.",
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com",
+      "wix": {
+        "language": "en-GB"
+      }
+    }
+  },
+  "plugins": {
+    "autostart": {
+      "args": ["--autostart"],
+      "macos_launch_agent": false
+    },
+    "updater": {
+      "active": false,
+      "endpoints": ["https://app.kefilex.com/api/desk-companion/check-update"],
+      "pubkey": ""
+    }
+  }
+}

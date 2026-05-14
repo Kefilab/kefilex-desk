@@ -1,0 +1,88 @@
+[package]
+name = "kefilex-desk"
+version = "0.1.0"
+description = "Live incoming-call capture for Kefilex Reception"
+authors = ["Kefilab Ltd."]
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/Kefilab/kefilex-desk"
+
+[lib]
+name = "kefilex_desk_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "kefilex-desk"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+# Core Tauri runtime — webview, tray, IPC, plugin host
+tauri = { version = "2.0", features = ["tray-icon"] }
+
+# Auto-start: writes/reads the Windows Run registry key (and the
+# equivalent on macOS / Linux for future cross-platform work).
+tauri-plugin-autostart = "2.0"
+
+# OS info (version reported back on heartbeat).
+tauri-plugin-os = "2.0"
+
+# Secure local key/value store backed by the OS keystore
+# (Windows Credential Manager on Windows). Used to persist the
+# pairing token after first install.
+tauri-plugin-store = "2.0"
+
+# HTTP client for talking to the Kefilex backend (pair, heartbeat,
+# call-event, check-update).
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "json",
+  "gzip",
+] }
+
+# Async runtime.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+# JSON serialisation.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Regex matching for notification filter rules.
+regex = "1"
+
+# Structured logging.
+log = "0.4"
+env_logger = "0.11"
+
+# Error handling.
+anyhow = "1"
+thiserror = "1"
+
+# UUID generation for client-side device-id local cache (server is
+# the source of truth though).
+uuid = { version = "1", features = ["v4"] }
+
+# Timestamps in ISO-8601 for outbound call events.
+chrono = { version = "0.4", features = ["serde"] }
+
+# ─── Windows-only deps ─────────────────────────────────────────────────
+# UserNotificationListener for cross-app notification observation.
+# Available since Windows 10 (Anniversary Update, build 14393).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+  "Foundation",
+  "Foundation_Collections",
+  "UI_Notifications",
+  "UI_Notifications_Management",
+  "ApplicationModel_Background",
+] }
+
+[features]
+# By default Tauri compiles with the platform's WebView (WebView2 on
+# Windows, WebKit on macOS, WebKitGTK on Linux). No conditional
+# features needed for v1.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
