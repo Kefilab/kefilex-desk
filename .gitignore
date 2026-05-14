@@ -1,0 +1,32 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Tauri build artefacts
+/src-tauri/target/
+/src-tauri/Cargo.lock
+/src-tauri/gen/
+
+# Node / npm (used for the Tauri webview UI shell)
+node_modules/
+dist/
+.next/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Signing artefacts (NEVER commit signing keys / certs)
+*.pfx
+*.p12
+*.cer
+signpath/
+
+# Local config
+.env
+.env.local
+config.local.toml
