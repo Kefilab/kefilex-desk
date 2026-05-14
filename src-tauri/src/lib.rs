@@ -105,14 +105,25 @@ pub fn run() {
             // a Tokio handle in so per-notification work (the HTTP
             // push to /api/desk-companion/call-event) can still be
             // spawned on the async pool.
+            //
+            // We grab Handle::current() from INSIDE an async task
+            // because the Tauri/Tokio runtime is not active on the
+            // main thread at setup-closure-call time — only on the
+            // worker threads it spawns. The async task is cheap: it
+            // does one std::thread::spawn then exits, while the OS
+            // thread it spawned inherits the Tokio handle.
             let ctx_for_nl = ctx.clone();
-            let rt_for_nl = tokio::runtime::Handle::current();
-            std::thread::Builder::new()
-                .name("kefilex-desk-notif".into())
-                .spawn(move || {
-                    notification_listener::run_blocking(ctx_for_nl, rt_for_nl);
-                })
-                .expect("spawn notification listener thread");
+            tauri::async_runtime::spawn(async move {
+                let rt = tokio::runtime::Handle::current();
+                if let Err(err) = std::thread::Builder::new()
+                    .name("kefilex-desk-notif".into())
+                    .spawn(move || {
+                        notification_listener::run_blocking(ctx_for_nl, rt);
+                    })
+                {
+                    log::error!("failed to spawn notification listener thread: {}", err);
+                }
+            });
 
             // First-launch UX: if there's no pairing token, pop the
             // window immediately so the user enters the 6-digit code.
