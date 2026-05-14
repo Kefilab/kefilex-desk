@@ -5,24 +5,37 @@
 //
 // Implementation is cfg-gated:
 //
-//   target_os = "windows" → real UserNotificationListener subscription
+//   target_os = "windows" → polls UserNotificationListener
 //   everything else       → no-op stub so the project still compiles
 //                           on macOS/Linux during development
 //
-// The Windows implementation needs Accessibility-tier permission
-// (Settings → Privacy → Notifications → "Let apps access your
-// notifications"). UserNotificationListener::Current().RequestAccessAsync()
-// triggers the OS prompt the first time, and the user grants or
-// denies once.
+// On Windows the listener has TWO read modes:
+//
+//   1. NotificationChanged event subscription — REQUIRES MSIX/UWP
+//      packaging. Classic Win32 apps (which is what Tauri produces
+//      by default) cannot register for this event; the call returns
+//      HRESULT 0x80070490 "Element not found".
+//
+//   2. GetNotificationsAsync polling — works on unpackaged Win32.
+//      Slightly higher latency (poll interval = 500ms ≈ worst-case
+//      delay before we detect a new toast) but reliable. Same data,
+//      same API, just a different read pattern.
+//
+// We use mode 2. If we later ship as MSIX, we can swap to the
+// event subscription for sub-100ms detection.
+//
+// On non-Windows we don't have a cross-app notification API at all.
+// macOS Notification Center observation requires Accessibility-tier
+// permission and undocumented APIs; out of scope for v1.
 
 use crate::{api, AppContext};
 use chrono::SecondsFormat;
 use std::time::Duration;
 
 /// Entry point for the notification listener. Runs synchronously on
-/// its own OS thread — windows-rs COM event handlers are not Send so
-/// they can't ride on Tokio's worker-stealing async runtime. We take
-/// a tokio::runtime::Handle so per-notification work (the HTTP push)
+/// its own OS thread — windows-rs COM types are not Send so they
+/// can't ride on Tokio's worker-stealing async runtime. We take a
+/// tokio::runtime::Handle so per-notification work (the HTTP push)
 /// can still be spawned onto the async pool.
 pub fn run_blocking(ctx: AppContext, rt: tokio::runtime::Handle) {
     log::info!(
@@ -73,12 +86,18 @@ pub fn build_call_event(
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::*;
-    use windows::Foundation::TypedEventHandler;
+    use std::collections::HashSet;
     use windows::UI::Notifications::{
         KnownNotificationBindings,
         Management::{UserNotificationListener, UserNotificationListenerAccessStatus},
-        UserNotificationChangedEventArgs,
+        NotificationKinds, UserNotification,
     };
+
+    /// How often we ask the OS for the current toast list. 500ms
+    /// gives 0-500ms worst-case latency on call detection — fast
+    /// enough that reception staff see the live toast pop "as the
+    /// phone rings" in practice, without burning CPU.
+    const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
     pub fn run_loop(ctx: AppContext, rt: tokio::runtime::Handle) {
         // Request access. The first time this runs on a machine,
@@ -94,9 +113,9 @@ mod windows_impl {
                 return;
             }
         };
-        // RequestAccessAsync returns an IAsyncOperation. In windows-rs
-        // 0.58 without the futures bridge, IAsyncOperation isn't a
-        // Future — call .get() to block on completion. Fine here
+        // RequestAccessAsync returns an IAsyncOperation. In
+        // windows-rs 0.58 without the futures bridge, IAsyncOperation
+        // isn't a Future — call .get() to block on completion. Fine
         // because we're at one-time startup, not a hot path.
         let access_op = match listener.RequestAccessAsync() {
             Ok(op) => op,
@@ -122,69 +141,77 @@ mod windows_impl {
             }
         }
 
-        log::info!("notification access granted; subscribing to events");
+        log::info!(
+            "notification access granted; polling every {:?}",
+            POLL_INTERVAL
+        );
 
-        // Listener gives us a delegate-based change event. Each
-        // notification spawns onto the Tokio runtime so the regex
-        // match + HTTP push doesn't block the COM thread. We pass
-        // the runtime handle in because this code runs on a plain
-        // std::thread where Handle::current() wouldn't find a
-        // Tokio context.
-        let ctx_for_handler = ctx.clone();
-        let rt_for_handler = rt.clone();
-        let handler = TypedEventHandler::<
-            UserNotificationListener,
-            UserNotificationChangedEventArgs,
-        >::new(move |sender, args| {
-            let ctx = ctx_for_handler.clone();
-            let listener_clone = sender.clone();
-            let args_clone = args.clone();
-            rt_for_handler.spawn(async move {
-                if let (Some(listener), Some(args)) = (listener_clone, args_clone) {
-                    if let Err(err) = handle_change(&listener, &args, &ctx).await {
-                        log::warn!("error handling notification: {:?}", err);
-                    }
-                }
-            });
-            Ok(())
-        });
+        // Polling loop. Maintains a "seen" set of notification IDs.
+        // First pass primes the set without dispatching so existing
+        // toasts already on screen don't all fire as fresh calls.
+        // After that, any unseen id is treated as a new notification.
+        //
+        // UserNotification.Id() is a u32 issued by the OS, typically
+        // monotonically increasing per session — but we track via a
+        // HashSet rather than a single high-water mark to handle the
+        // edge case where Windows recycles ids between sessions.
+        let mut seen_ids: HashSet<u32> = HashSet::new();
+        let mut primed = false;
 
-        let _registration_token = match listener.NotificationChanged(&handler) {
-            Ok(token) => {
-                log::info!("notification subscription active");
-                token
-            }
-            Err(err) => {
-                log::error!("failed to subscribe to NotificationChanged: {:?}", err);
-                return;
-            }
-        };
-
-        // Park this OS thread. The actual work happens inside the
-        // event handler closure registered above. blocking sleep is
-        // correct here because this isn't an async task.
         loop {
-            std::thread::sleep(Duration::from_secs(3600));
+            if let Err(err) = poll_once(&listener, &mut seen_ids, primed, &ctx, &rt) {
+                log::warn!("notification poll failed: {:?}", err);
+            }
+            primed = true;
+            std::thread::sleep(POLL_INTERVAL);
         }
     }
 
-    async fn handle_change(
+    /// Pull the current list of toast notifications, diff against
+    /// the seen-set, dispatch any newcomers. On first pass `primed`
+    /// is false so we just populate the set without firing events.
+    fn poll_once(
         listener: &UserNotificationListener,
-        args: &UserNotificationChangedEventArgs,
+        seen_ids: &mut HashSet<u32>,
+        primed: bool,
         ctx: &AppContext,
-    ) -> anyhow::Result<()> {
-        // Only care about additions. Removals are when the user
-        // dismisses an existing toast — not our trigger.
-        use windows::UI::Notifications::UserNotificationChangedKind;
-        if args.ChangeKind()? != UserNotificationChangedKind::Added {
-            return Ok(());
-        }
-        let notification_id = args.UserNotificationId()?;
+        rt: &tokio::runtime::Handle,
+    ) -> windows::core::Result<()> {
+        let async_op = listener.GetNotificationsAsync(NotificationKinds::Toast)?;
+        let notifications = async_op.get()?;
+        let count = notifications.Size()?;
 
-        // Pull the full notification (the change event only gives us
-        // the id). GetNotification returns the toast bundled with
-        // its source app info and text content.
-        let n = listener.GetNotification(notification_id)?;
+        for i in 0..count {
+            let n = notifications.GetAt(i)?;
+            let id = n.Id()?;
+            if !seen_ids.insert(id) {
+                // Already seen — HashSet::insert returned false.
+                continue;
+            }
+            if !primed {
+                // First pass — record but don't dispatch. Avoids a
+                // flurry of "incoming call" events when the user
+                // starts the companion while a bunch of toasts are
+                // already on screen.
+                continue;
+            }
+            // New notification — process it (errors don't stop the
+            // loop; we just log and move on).
+            if let Err(err) = handle_notification(&n, ctx, rt) {
+                log::warn!("handle_notification failed: {:?}", err);
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the notification's source app + text, pattern-match
+    /// against the filter registry, and POST a call event if
+    /// something matches.
+    fn handle_notification(
+        n: &UserNotification,
+        ctx: &AppContext,
+        rt: &tokio::runtime::Handle,
+    ) -> windows::core::Result<()> {
         let app_info = n.AppInfo()?;
         let app_id = app_info.AppUserModelId()?.to_string();
 
@@ -211,10 +238,8 @@ mod windows_impl {
         let combined = format!("{} | {}", title, body);
         log::debug!("notification from {}: {}", app_id, combined);
 
-        // Pattern-match against the built-in filter registry. If
-        // nothing matches, the notification wasn't a call — silently
-        // ignore.
-        let Some(filter_match) = crate::voip_filters::match_notification(&app_id, &title, &body)
+        let Some(filter_match) =
+            crate::voip_filters::match_notification(&app_id, &title, &body)
         else {
             return Ok(());
         };
@@ -227,27 +252,29 @@ mod windows_impl {
             filter_match.caller_display_name
         );
 
-        // Token check — if we're unpaired, log + skip rather than
-        // panic. Reception's status pill will show the unpaired
-        // state to nudge the user.
-        let token = {
-            let cfg = ctx.config.read().await;
-            cfg.token.clone()
-        };
-        let Some(token) = token else {
-            log::warn!("matched a call but not paired — ignoring");
-            return Ok(());
-        };
-
+        // Push HTTP work onto the Tokio runtime. The clones are
+        // cheap (Arcs and small structs) and we move into the spawned
+        // task so the COM thread isn't held by the network call.
+        let ctx_clone = ctx.clone();
         let event = build_call_event(&filter_match, &combined);
-        match api::call_event(&ctx.api_base, &ctx.http, &token, &event).await {
-            Ok(resp) => {
-                log::info!("posted call event: call_id={}", resp.call_id);
+        rt.spawn(async move {
+            let token = {
+                let cfg = ctx_clone.config.read().await;
+                cfg.token.clone()
+            };
+            let Some(token) = token else {
+                log::warn!("matched a call but not paired — ignoring");
+                return;
+            };
+            match api::call_event(&ctx_clone.api_base, &ctx_clone.http, &token, &event).await {
+                Ok(resp) => {
+                    log::info!("posted call event: call_id={}", resp.call_id);
+                }
+                Err(err) => {
+                    log::warn!("posting call event failed: {:?}", err);
+                }
             }
-            Err(err) => {
-                log::warn!("posting call event failed: {:?}", err);
-            }
-        }
+        });
         Ok(())
     }
 }
