@@ -15,7 +15,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, Wry};
+use tauri::{AppHandle, Wry};
 use tauri_plugin_store::StoreExt;
 
 const STORE_FILE: &str = "config.json";

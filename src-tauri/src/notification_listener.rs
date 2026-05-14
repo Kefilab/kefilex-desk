@@ -69,8 +69,9 @@ mod windows_impl {
     use super::*;
     use windows::Foundation::TypedEventHandler;
     use windows::UI::Notifications::{
-        KnownNotificationBindings, Management::UserNotificationListener,
-        NotificationKinds, UserNotificationChangedEventArgs,
+        KnownNotificationBindings,
+        Management::{UserNotificationListener, UserNotificationListenerAccessStatus},
+        UserNotificationChangedEventArgs,
     };
 
     pub async fn run_loop(ctx: AppContext) {
@@ -87,16 +88,19 @@ mod windows_impl {
                 return;
             }
         };
-        let access = match listener.RequestAccessAsync() {
-            Ok(op) => op.await,
+        // RequestAccessAsync returns an IAsyncOperation. In windows-rs
+        // 0.58 without the futures bridge, IAsyncOperation isn't a
+        // Future — call .get() to block on completion. Fine here
+        // because we're at one-time startup, not a hot path.
+        let access_op = match listener.RequestAccessAsync() {
+            Ok(op) => op,
             Err(err) => {
                 log::error!("RequestAccessAsync invocation failed: {:?}", err);
                 return;
             }
         };
-        match access {
+        match access_op.get() {
             Ok(access_status) => {
-                use windows::UI::Notifications::UserNotificationListenerAccessStatus;
                 if access_status != UserNotificationListenerAccessStatus::Allowed {
                     log::warn!(
                         "Notification access not granted (status={:?}). \
@@ -107,7 +111,7 @@ mod windows_impl {
                 }
             }
             Err(err) => {
-                log::error!("RequestAccessAsync failed: {:?}", err);
+                log::error!("RequestAccessAsync.get() failed: {:?}", err);
                 return;
             }
         }
@@ -122,9 +126,14 @@ mod windows_impl {
             UserNotificationListener,
             UserNotificationChangedEventArgs,
         >::new(move |sender, args| {
+            // windows-rs TypedEventHandler hands us &Option<T> for
+            // each argument. We clone the whole Option (cheap — both
+            // T types are COM-RC pointers) and move into the spawned
+            // task. Using sender.cloned() — which is Iterator-only —
+            // is the wrong type here.
             let ctx = ctx_for_handler.clone();
-            let listener_clone = sender.cloned().ok();
-            let args_clone = args.cloned().ok();
+            let listener_clone = sender.clone();
+            let args_clone = args.clone();
             tokio::spawn(async move {
                 if let (Some(listener), Some(args)) = (listener_clone, args_clone) {
                     if let Err(err) = handle_change(&listener, &args, &ctx).await {
@@ -170,7 +179,7 @@ mod windows_impl {
         // its source app info and text content.
         let n = listener.GetNotification(notification_id)?;
         let app_info = n.AppInfo()?;
-        let app_id = app_info.AppUserModelId()?.to_string_lossy();
+        let app_id = app_info.AppUserModelId()?.to_string();
 
         let toast = n.Notification()?;
         let visual = toast.Visual()?;
@@ -180,7 +189,7 @@ mod windows_impl {
         let mut title = String::new();
         let mut body = String::new();
         for (i, t) in texts.into_iter().enumerate() {
-            let text = t.Text()?.to_string_lossy();
+            let text = t.Text()?.to_string();
             match i {
                 0 => title = text,
                 _ => {

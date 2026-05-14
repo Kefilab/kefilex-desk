@@ -22,6 +22,7 @@ mod tray;
 mod voip_filters;
 
 use std::sync::Arc;
+use tauri::Manager;
 use tokio::sync::RwLock;
 
 /// Runtime context shared between the Tauri tray, notification
