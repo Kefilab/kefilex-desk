@@ -19,22 +19,28 @@ use crate::{api, AppContext};
 use chrono::SecondsFormat;
 use std::time::Duration;
 
-pub async fn run(ctx: AppContext) {
+/// Entry point for the notification listener. Runs synchronously on
+/// its own OS thread — windows-rs COM event handlers are not Send so
+/// they can't ride on Tokio's worker-stealing async runtime. We take
+/// a tokio::runtime::Handle so per-notification work (the HTTP push)
+/// can still be spawned onto the async pool.
+pub fn run_blocking(ctx: AppContext, rt: tokio::runtime::Handle) {
     log::info!(
         "notification listener starting (platform: {})",
         std::env::consts::OS
     );
     #[cfg(target_os = "windows")]
     {
-        windows_impl::run_loop(ctx).await;
+        windows_impl::run_loop(ctx, rt);
     }
     #[cfg(not(target_os = "windows"))]
     {
         // On non-Windows we don't have a cross-app notification API.
-        // Park the task so the runtime doesn't tear it down.
+        // Park the thread so it doesn't churn the scheduler.
         let _ = ctx;
+        let _ = rt;
         loop {
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            std::thread::sleep(Duration::from_secs(3600));
         }
     }
 }
@@ -74,7 +80,7 @@ mod windows_impl {
         UserNotificationChangedEventArgs,
     };
 
-    pub async fn run_loop(ctx: AppContext) {
+    pub fn run_loop(ctx: AppContext, rt: tokio::runtime::Handle) {
         // Request access. The first time this runs on a machine,
         // Windows pops a permission prompt. Subsequent runs return
         // the cached answer.
@@ -118,23 +124,22 @@ mod windows_impl {
 
         log::info!("notification access granted; subscribing to events");
 
-        // Listener gives us a delegate-based change event. Wrap it so
-        // each notification fires a Tokio task that does the regex
-        // match + HTTP push without blocking the COM thread.
+        // Listener gives us a delegate-based change event. Each
+        // notification spawns onto the Tokio runtime so the regex
+        // match + HTTP push doesn't block the COM thread. We pass
+        // the runtime handle in because this code runs on a plain
+        // std::thread where Handle::current() wouldn't find a
+        // Tokio context.
         let ctx_for_handler = ctx.clone();
+        let rt_for_handler = rt.clone();
         let handler = TypedEventHandler::<
             UserNotificationListener,
             UserNotificationChangedEventArgs,
         >::new(move |sender, args| {
-            // windows-rs TypedEventHandler hands us &Option<T> for
-            // each argument. We clone the whole Option (cheap — both
-            // T types are COM-RC pointers) and move into the spawned
-            // task. Using sender.cloned() — which is Iterator-only —
-            // is the wrong type here.
             let ctx = ctx_for_handler.clone();
             let listener_clone = sender.clone();
             let args_clone = args.clone();
-            tokio::spawn(async move {
+            rt_for_handler.spawn(async move {
                 if let (Some(listener), Some(args)) = (listener_clone, args_clone) {
                     if let Err(err) = handle_change(&listener, &args, &ctx).await {
                         log::warn!("error handling notification: {:?}", err);
@@ -144,20 +149,22 @@ mod windows_impl {
             Ok(())
         });
 
-        match listener.NotificationChanged(&handler) {
-            Ok(_token) => {
+        let _registration_token = match listener.NotificationChanged(&handler) {
+            Ok(token) => {
                 log::info!("notification subscription active");
+                token
             }
             Err(err) => {
                 log::error!("failed to subscribe to NotificationChanged: {:?}", err);
                 return;
             }
-        }
+        };
 
-        // Park the task — the actual work happens in the event
-        // handler we just registered.
+        // Park this OS thread. The actual work happens inside the
+        // event handler closure registered above. blocking sleep is
+        // correct here because this isn't an async task.
         loop {
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            std::thread::sleep(Duration::from_secs(3600));
         }
     }
 

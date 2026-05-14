@@ -97,12 +97,22 @@ pub fn run() {
             });
 
             // Notification listener: starts up the Windows
-            // UserNotificationListener subscription. On non-Windows
-            // platforms this is a no-op stub.
+            // UserNotificationListener subscription. windows-rs COM
+            // event handlers contain NonNull<c_void> which is !Send,
+            // so the listener can't run on Tauri's async runtime
+            // (work-stealing executor moves tasks between threads).
+            // It gets its own dedicated OS thread instead. We pass
+            // a Tokio handle in so per-notification work (the HTTP
+            // push to /api/desk-companion/call-event) can still be
+            // spawned on the async pool.
             let ctx_for_nl = ctx.clone();
-            tauri::async_runtime::spawn(async move {
-                notification_listener::run(ctx_for_nl).await;
-            });
+            let rt_for_nl = tokio::runtime::Handle::current();
+            std::thread::Builder::new()
+                .name("kefilex-desk-notif".into())
+                .spawn(move || {
+                    notification_listener::run_blocking(ctx_for_nl, rt_for_nl);
+                })
+                .expect("spawn notification listener thread");
 
             // First-launch UX: if there's no pairing token, pop the
             // window immediately so the user enters the 6-digit code.
