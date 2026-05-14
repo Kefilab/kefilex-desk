@@ -9,6 +9,14 @@
 // All errors bubble up as anyhow::Error; the calling Tauri commands
 // convert them to strings for the WebView.
 
+// API response structs hold fields that we may not actively read but
+// still want deserialised — gives us the data if a future caller wants
+// to check `ok`, log `server_time`, etc. Suppress the dead-code warnings
+// here because the values ARE used semantically (forward-compat with
+// any new fields the server might add) even if no local code path reads
+// them yet.
+#![allow(dead_code)]
+
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 

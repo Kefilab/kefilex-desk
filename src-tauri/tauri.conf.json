@@ -58,15 +58,5 @@
       }
     }
   },
-  "plugins": {
-    "autostart": {
-      "args": ["--autostart"],
-      "macos_launch_agent": false
-    },
-    "updater": {
-      "active": false,
-      "endpoints": ["https://app.kefilex.com/api/desk-companion/check-update"],
-      "pubkey": ""
-    }
-  }
+  "plugins": {}
 }
