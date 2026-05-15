@@ -69,15 +69,29 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # ─── Windows-only deps ─────────────────────────────────────────────────
-# UserNotificationListener for cross-app notification observation.
-# Available since Windows 10 (Anniversary Update, build 14393).
+# Two distinct API surfaces we use:
+#   WinRT-style features (Foundation, UI_Notifications, …) — modern
+#     async API for the toast notification listener.
+#   Win32-style features (Win32_*) — older COM API for the CoreAudio
+#     session monitor, which gives us per-process audio session state
+#     so we can detect "VXT is playing a ringtone" the instant it
+#     starts. The Win32 audio API is what every softphone uses
+#     under the hood; observing it works regardless of whether the
+#     softphone posts an OS notification.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
+  # WinRT — toast notification listener
   "Foundation",
   "Foundation_Collections",
   "UI_Notifications",
   "UI_Notifications_Management",
   "ApplicationModel_Background",
+  # Win32 COM — CoreAudio session enumeration
+  "Win32_Media_Audio",
+  "Win32_System_Com",
+  "Win32_System_Threading",
+  "Win32_System_ProcessStatus",
+  "Win32_Foundation",
 ] }
 
 [features]

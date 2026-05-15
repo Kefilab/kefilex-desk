@@ -15,6 +15,7 @@
 //   heartbeat         60-second loop posting to /api/desk-companion/heartbeat
 
 mod api;
+mod audio_listener;
 mod config;
 mod heartbeat;
 mod notification_listener;
@@ -122,6 +123,27 @@ pub fn run() {
                     })
                 {
                     log::error!("failed to spawn notification listener thread: {}", err);
+                }
+            });
+
+            // CoreAudio session listener — fires "ringing" events
+            // when ANY softphone process starts playing audio (i.e.
+            // a ringtone). Catches VXT et al. as soon as the phone
+            // starts ringing, since softphones play their ringtone
+            // through Windows audio. Same threading model as the
+            // notification listener: COM objects aren't Send, so we
+            // give it its own OS thread + Tokio handle for the
+            // HTTP push.
+            let ctx_for_al = ctx.clone();
+            tauri::async_runtime::spawn(async move {
+                let rt = tokio::runtime::Handle::current();
+                if let Err(err) = std::thread::Builder::new()
+                    .name("kefilex-desk-audio".into())
+                    .spawn(move || {
+                        audio_listener::run_blocking(ctx_for_al, rt);
+                    })
+                {
+                    log::error!("failed to spawn audio session listener thread: {}", err);
                 }
             });
 
