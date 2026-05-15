@@ -86,6 +86,10 @@ windows = { version = "0.58", features = [
   "UI_Notifications",
   "UI_Notifications_Management",
   "ApplicationModel_Background",
+  # Raw toast XML access (ToastNotification::Content() -> XmlDocument).
+  # Used by the voip-dump diagnostic to see action buttons, attributes,
+  # and any fields the text-element parser would otherwise discard.
+  "Data_Xml_Dom",
   # Win32 COM — CoreAudio session enumeration
   "Win32_Media_Audio",
   "Win32_System_Com",

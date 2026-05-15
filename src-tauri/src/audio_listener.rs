@@ -69,9 +69,9 @@ mod windows_impl {
     use windows::core::Interface;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Media::Audio::{
-        eCapture, eConsole, eRender, AudioSessionStateActive, IAudioSessionControl2,
-        IAudioSessionEnumerator, IAudioSessionManager2, IMMDevice, IMMDeviceCollection,
-        IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+        eCapture, eConsole, eRender, AudioSessionStateActive, IAudioSessionControl,
+        IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2, IMMDevice,
+        IMMDeviceCollection, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
         DEVICE_STATE_DISABLED, DEVICE_STATE_NOTPRESENT, DEVICE_STATE_UNPLUGGED,
     };
     use windows::Win32::System::Com::{
@@ -251,6 +251,21 @@ mod windows_impl {
                     continue;
                 };
 
+                // One-shot diagnostic: dump every COM property we can pull
+                // off the IAudioSessionControl / IAudioSessionControl2 for
+                // the first VoIP-matched active session this process sees.
+                // Goal: see if caller info hides in GetDisplayName,
+                // GetSessionInstanceIdentifier, or other fields we don't
+                // currently read.
+                if !AUDIO_DUMP_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    dump_audio_session_fully(
+                        &session_control,
+                        &session2,
+                        pid,
+                        &process_name,
+                    );
+                }
+
                 active_voip_pids.push((pid, process_name, display_name));
             }
         }
@@ -308,6 +323,80 @@ mod windows_impl {
         }
 
         Ok(())
+    }
+
+    /// Guard for the one-shot voip-dump diagnostic. Set true after the
+    /// first VoIP-matched active session has been fully dumped, so we
+    /// don't repeat the dump on every poll while the call continues.
+    static AUDIO_DUMP_DONE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Diagnostic — log every property we can pull off the
+    /// IAudioSessionControl / IAudioSessionControl2 pair for one
+    /// session. Used to investigate whether softphones write caller
+    /// info into session metadata fields (DisplayName etc) that our
+    /// regular path ignores. All errors are absorbed.
+    fn dump_audio_session_fully(
+        session_control: &IAudioSessionControl,
+        session2: &IAudioSessionControl2,
+        pid: u32,
+        process_name: &str,
+    ) {
+        log::info!(
+            "voip-dump: ── audio session pid={} process={} ──",
+            pid,
+            process_name
+        );
+
+        unsafe {
+            match session_control.GetDisplayName() {
+                Ok(pw) => {
+                    let s = pw.to_string().unwrap_or_else(|_| "<utf16-err>".into());
+                    log::info!("voip-dump:   GetDisplayName: '{}'", s);
+                }
+                Err(e) => log::info!("voip-dump:   GetDisplayName: <err {:?}>", e),
+            }
+            match session_control.GetIconPath() {
+                Ok(pw) => {
+                    let s = pw.to_string().unwrap_or_else(|_| "<utf16-err>".into());
+                    log::info!("voip-dump:   GetIconPath: '{}'", s);
+                }
+                Err(e) => log::info!("voip-dump:   GetIconPath: <err {:?}>", e),
+            }
+            match session_control.GetGroupingParam() {
+                Ok(guid) => log::info!("voip-dump:   GetGroupingParam: {:?}", guid),
+                Err(e) => log::info!("voip-dump:   GetGroupingParam: <err {:?}>", e),
+            }
+            match session2.GetSessionInstanceIdentifier() {
+                Ok(pw) => {
+                    let s = pw.to_string().unwrap_or_else(|_| "<utf16-err>".into());
+                    log::info!("voip-dump:   GetSessionInstanceIdentifier: '{}'", s);
+                }
+                Err(e) => log::info!(
+                    "voip-dump:   GetSessionInstanceIdentifier: <err {:?}>",
+                    e
+                ),
+            }
+            match session2.GetSessionIdentifier() {
+                Ok(pw) => {
+                    let s = pw.to_string().unwrap_or_else(|_| "<utf16-err>".into());
+                    log::info!("voip-dump:   GetSessionIdentifier: '{}'", s);
+                }
+                Err(e) => log::info!("voip-dump:   GetSessionIdentifier: <err {:?}>", e),
+            }
+            // IsSystemSoundsSession returns S_OK if it IS a system-sounds
+            // session, S_FALSE otherwise. windows-rs maps S_FALSE to Err
+            // with the HRESULT, so both branches are informative.
+            match session2.IsSystemSoundsSession() {
+                Ok(()) => log::info!("voip-dump:   IsSystemSoundsSession: yes (S_OK)"),
+                Err(e) => log::info!(
+                    "voip-dump:   IsSystemSoundsSession: no (HRESULT={:?})",
+                    e
+                ),
+            }
+        }
+
+        log::info!("voip-dump: ── end audio session ──");
     }
 
     /// One-shot startup diagnostic. Walks every audio endpoint in

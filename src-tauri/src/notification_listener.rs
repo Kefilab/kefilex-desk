@@ -92,7 +92,7 @@ mod windows_impl {
     use windows::UI::Notifications::{
         KnownNotificationBindings,
         Management::{UserNotificationListener, UserNotificationListenerAccessStatus},
-        NotificationKinds, UserNotification,
+        NotificationKinds, ToastNotification, UserNotification,
     };
 
     /// How often we ask the OS for the current toast list. 500ms
@@ -218,6 +218,17 @@ mod windows_impl {
         let app_id = app_info.AppUserModelId()?.to_string();
 
         let toast = n.Notification()?;
+
+        // One-shot diagnostic: dump the full structure of every notification
+        // whose AUMID matches a known softphone filter. Runs BEFORE the
+        // ToastGeneric binding parse so we still see something even if the
+        // toast uses a different template. Goal: see whether VXT (or any
+        // softphone) puts the phone number into action buttons, attributes,
+        // or template fields that our text-only parser currently discards.
+        if is_voip_app_id(&app_id) {
+            dump_notification_fully(n, &toast, &app_id);
+        }
+
         let visual = toast.Visual()?;
         let binding = visual.GetBinding(&KnownNotificationBindings::ToastGeneric()?)?;
         let texts = binding.GetTextElements()?;
@@ -278,5 +289,64 @@ mod windows_impl {
             }
         });
         Ok(())
+    }
+
+    /// True if the AUMID substring-matches any softphone filter's
+    /// app_id_patterns. Used to scope the voip-dump diagnostic to
+    /// notifications worth dumping.
+    fn is_voip_app_id(app_id: &str) -> bool {
+        let lower = app_id.to_lowercase();
+        for filter in crate::voip_filters::BUILTIN_FILTERS {
+            for pattern in filter.app_id_patterns {
+                if lower.contains(&pattern.to_lowercase()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Diagnostic — log everything we can pull off a softphone toast,
+    /// including the raw XML payload. Fires once per VoIP-app
+    /// notification (low volume — typically one per call) and lets us
+    /// see if caller info hides in action buttons, hint attributes,
+    /// custom templates, or other fields the text-only parser skips.
+    ///
+    /// All errors are absorbed — best-effort visibility.
+    fn dump_notification_fully(
+        n: &UserNotification,
+        toast: &ToastNotification,
+        app_id: &str,
+    ) {
+        log::info!("voip-dump: ── notification from app_id={} ──", app_id);
+
+        if let Ok(id) = n.Id() {
+            log::info!("voip-dump:   UserNotification.Id: {}", id);
+        }
+
+        match toast.Tag() {
+            Ok(s) => log::info!("voip-dump:   ToastNotification.Tag: '{}'", s),
+            Err(e) => log::info!("voip-dump:   ToastNotification.Tag: <err {:?}>", e),
+        }
+        match toast.Group() {
+            Ok(s) => log::info!("voip-dump:   ToastNotification.Group: '{}'", s),
+            Err(e) => log::info!("voip-dump:   ToastNotification.Group: <err {:?}>", e),
+        }
+        match toast.Priority() {
+            Ok(p) => log::info!("voip-dump:   ToastNotification.Priority: {:?}", p),
+            Err(e) => log::info!("voip-dump:   ToastNotification.Priority: <err {:?}>", e),
+        }
+
+        // The big payload — raw toast XML covers every text element,
+        // action button, image, hint, and attribute the publisher set.
+        match toast.Content() {
+            Ok(xml_doc) => match xml_doc.GetXml() {
+                Ok(xml) => log::info!("voip-dump:   raw XML:\n{}", xml),
+                Err(e) => log::warn!("voip-dump:   GetXml() failed: {:?}", e),
+            },
+            Err(e) => log::warn!("voip-dump:   Content() failed: {:?}", e),
+        }
+
+        log::info!("voip-dump: ── end notification ──");
     }
 }
