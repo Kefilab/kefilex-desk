@@ -177,38 +177,68 @@ mod windows_impl {
         // Build the set of PIDs that ARE VoIP-matched and currently active.
         let mut active_voip_pids = Vec::new();
 
+        // Diagnostic counter — log a one-liner per poll showing how
+        // many sessions we saw, vs how many were Active, vs how many
+        // matched a VoIP filter. Helps spot the "VXT session isn't
+        // appearing at all" case without scrolling through per-session
+        // debug spam.
+        let mut total_seen = 0u32;
+        let mut active_seen = 0u32;
+
         for i in 0..count {
+            total_seen += 1;
             let session_control = unsafe { sessions.GetSession(i)? };
             let session2: IAudioSessionControl2 = session_control.cast()?;
 
-            // Skip if not active.
             let session_state = unsafe { session_control.GetState()? };
+            // Get PID even for inactive sessions so the debug log
+            // can attribute them. PID may be 0 for system mixer.
+            let pid = unsafe { session2.GetProcessId().unwrap_or(0) };
+
+            // Resolve process name. Best-effort — may return None
+            // for system PID 0 or processes we can't open.
+            let process_name = if pid == 0 {
+                "<system>".to_string()
+            } else {
+                get_process_name(pid).unwrap_or_else(|| format!("<pid-{}>", pid))
+            };
+
+            // Match against VoIP filters BEFORE the active-only gate
+            // so the debug log shows whether VXT (or whatever) is
+            // present at all, even if it's not currently playing.
+            let voip_match = match_voip_process(&process_name);
+
+            // One debug line per session, every poll. Verbose but
+            // exactly what we need to diagnose the "VXT not detected"
+            // case. Filter at RUST_LOG=debug at runtime.
+            log::debug!(
+                "audio session: pid={} state={:?} process={} voip_match={:?}",
+                pid,
+                session_state,
+                process_name,
+                voip_match
+            );
+
+            // Apply the actual filtering for the ringing-detection
+            // logic.
             if session_state != AudioSessionStateActive {
                 continue;
             }
-
-            // PID 0 is the System session (mixer, OS sounds).
-            let pid = unsafe { session2.GetProcessId()? };
+            active_seen += 1;
             if pid == 0 {
                 continue;
             }
-
-            // Read the process executable name — gives us
-            // "vxt.exe" or "Microsoft Teams.exe" or whatever the
-            // softphone calls itself. Substring-match against the
-            // existing VoIP filter app_id_patterns; they're
-            // permissive enough ("vxt", "teams", "ringcentral") to
-            // catch both AUMIDs from the notification listener and
-            // exe names here.
-            let Some(process_name) = get_process_name(pid) else {
-                continue;
-            };
-            let Some(display_name) = match_voip_process(&process_name) else {
+            let Some(display_name) = voip_match else {
                 continue;
             };
 
             active_voip_pids.push((pid, process_name, display_name));
         }
+
+        // Per-poll summary at INFO level so it shows up even without
+        // RUST_LOG=debug. Capped at one line per 10 polls (5s) to
+        // keep the terminal clean during normal operation.
+        log_poll_summary(total_seen, active_seen, active_voip_pids.len() as u32);
 
         // Drive the state machine for each currently-active VoIP PID.
         for (pid, process_name, display_name) in &active_voip_pids {
@@ -255,6 +285,26 @@ mod windows_impl {
         }
 
         Ok(())
+    }
+
+    /// Diagnostic helper — print a "poll summary" line every ~5
+    /// seconds at INFO level so we can confirm the listener is
+    /// alive and see what it's observing without needing to enable
+    /// RUST_LOG=debug. Internal counter resets at usize::MAX.
+    fn log_poll_summary(total: u32, active: u32, voip_active: u32) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Every 10th poll (~5s) print a summary line. Plus print
+        // whenever voip_active > 0 since that's the interesting case.
+        if n % 10 == 0 || voip_active > 0 {
+            log::info!(
+                "audio session poll: {} total, {} active, {} voip-matched",
+                total,
+                active,
+                voip_active
+            );
+        }
     }
 
     /// Resolve a Windows process id to its executable filename.
