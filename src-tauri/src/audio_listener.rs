@@ -64,6 +64,9 @@ mod windows_impl {
     use super::*;
     use chrono::SecondsFormat;
     use std::collections::HashMap;
+    // Interface trait gives us .cast() on COM pointers (e.g. casting
+    // IAudioSessionControl to its IAudioSessionControl2 superset).
+    use windows::core::Interface;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Media::Audio::{
         eMultimedia, eRender, IAudioSessionControl2, IAudioSessionEnumerator,
@@ -160,23 +163,12 @@ mod windows_impl {
         let device: IMMDevice =
             unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)? };
 
-        // Activate the per-device session manager. The Activate call
-        // wants a GUID and returns an interface pointer; windows-rs's
-        // typed wrapper does the GUID lookup from T.
-        let session_mgr: IAudioSessionManager2 = unsafe {
-            let mut out: Option<IAudioSessionManager2> = None;
-            device.Activate(
-                CLSCTX_ALL,
-                None,
-                &mut out as *mut _ as *mut _,
-            )?;
-            out.ok_or_else(|| {
-                windows::core::Error::new(
-                    windows::core::HRESULT(-1),
-                    "device.Activate returned null IAudioSessionManager2".into(),
-                )
-            })?
-        };
+        // Activate the per-device session manager. In windows-rs 0.58
+        // the typed wrapper takes 2 args (CLSCTX + optional activation
+        // params) and returns Result<T> — T is inferred from the let
+        // binding's type annotation. No manual out-pointer juggling.
+        let session_mgr: IAudioSessionManager2 =
+            unsafe { device.Activate(CLSCTX_ALL, None)? };
 
         let sessions: IAudioSessionEnumerator =
             unsafe { session_mgr.GetSessionEnumerator()? };
@@ -272,7 +264,11 @@ mod windows_impl {
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
             let mut buf = [0u16; 1024];
-            let len = GetModuleFileNameExW(Some(handle), None, &mut buf);
+            // GetModuleFileNameExW in windows-rs 0.58 takes the HANDLE
+            // directly (it implements Param<HANDLE> by value), not
+            // wrapped in Some(). For hmodule we pass None to mean
+            // "the executable module of the target process".
+            let len = GetModuleFileNameExW(handle, None, &mut buf);
             let _ = CloseHandle(handle);
             if len == 0 {
                 return None;
