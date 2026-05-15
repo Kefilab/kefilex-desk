@@ -197,7 +197,7 @@ mod windows_impl {
             } {
                 Ok(m) => m,
                 Err(err) => {
-                    log::debug!(
+                    log::trace!(
                         "device {} Activate(IAudioSessionManager2) failed: {:?}",
                         di,
                         err
@@ -218,30 +218,35 @@ mod windows_impl {
                 let session_state = unsafe { session_control.GetState()? };
                 let pid = unsafe { session2.GetProcessId().unwrap_or(0) };
 
-                let process_name = if pid == 0 {
-                    "<system>".to_string()
-                } else {
-                    get_process_name(pid).unwrap_or_else(|| format!("<pid-{}>", pid))
-                };
-
-                let voip_match = match_voip_process(&process_name);
-
-                log::debug!(
-                    "audio session: device={} pid={} state={:?} process={} voip_match={:?}",
-                    di,
-                    pid,
-                    session_state,
-                    process_name,
-                    voip_match
-                );
-
+                // Only Active sessions can drive an event. Idle sessions
+                // (Spotify-but-paused, Discord-in-tray, etc.) routinely
+                // sit in the enumerator and resolving their process name
+                // on every poll is wasted work + log noise. Skip early.
                 if session_state != AudioSessionStateActive {
                     continue;
                 }
                 active_seen += 1;
                 if pid == 0 {
+                    // System session (e.g. Windows notification chimes).
+                    // Active but uninteresting.
                     continue;
                 }
+
+                let process_name = get_process_name(pid)
+                    .unwrap_or_else(|| format!("<pid-{}>", pid));
+                let voip_match = match_voip_process(&process_name);
+
+                // TRACE level — only visible with RUST_LOG=trace. Useful
+                // when investigating "what's playing on this machine" but
+                // not part of normal operation.
+                log::trace!(
+                    "active audio session: device={} pid={} process={} voip_match={:?}",
+                    di,
+                    pid,
+                    process_name,
+                    voip_match
+                );
+
                 let Some(display_name) = voip_match else {
                     continue;
                 };
@@ -396,15 +401,27 @@ mod windows_impl {
         log::info!("audio-config: ── end endpoint dump ──");
     }
 
-    /// Diagnostic helper — print a "poll summary" line every ~5
-    /// seconds at INFO level so we can confirm the listener is
-    /// alive and see what it's observing without needing to enable
-    /// RUST_LOG=debug.
+    /// Diagnostic helper — emits a "poll summary" line at INFO only
+    /// when something interesting happens: the count of active sessions
+    /// changed, the count of voip-matched sessions changed, or every
+    /// 30 seconds (60 polls @ 500ms) as a quiet heartbeat. Previously
+    /// fired every poll while voip_active > 0, which drowned out the
+    /// actual call-lifecycle events during a ring.
     fn log_poll_summary(devices: u32, total: u32, active: u32, voip_active: u32) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        // u32::MAX sentinel means "no prior reading" so the first poll
+        // always logs a baseline.
+        static PREV_ACTIVE: AtomicU32 = AtomicU32::new(u32::MAX);
+        static PREV_VOIP: AtomicU32 = AtomicU32::new(u32::MAX);
+
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        if n % 10 == 0 || voip_active > 0 {
+        let prev_active = PREV_ACTIVE.swap(active, Ordering::Relaxed);
+        let prev_voip = PREV_VOIP.swap(voip_active, Ordering::Relaxed);
+
+        let state_changed = prev_active != active || prev_voip != voip_active;
+        let periodic = n % 60 == 0;
+        if state_changed || periodic {
             log::info!(
                 "audio session poll: {} devices, {} sessions total, {} active, {} voip-matched",
                 devices,
