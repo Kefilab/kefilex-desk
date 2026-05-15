@@ -69,9 +69,9 @@ mod windows_impl {
     use windows::core::Interface;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Media::Audio::{
-        eMultimedia, eRender, IAudioSessionControl2, IAudioSessionEnumerator,
-        IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
-        AudioSessionStateActive,
+        eRender, IAudioSessionControl2, IAudioSessionEnumerator,
+        IAudioSessionManager2, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator,
+        MMDeviceEnumerator, AudioSessionStateActive, DEVICE_STATE_ACTIVE,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_ALL, CLSCTX_INPROC_SERVER,
@@ -150,95 +150,101 @@ mod windows_impl {
         }
     }
 
-    /// Walk every active audio session on the default render device,
+    /// Walk every active audio session on EVERY active render endpoint,
     /// look up the owning process, match against the VoIP filter
-    /// registry, and fire `ringing` for new sustained-active
-    /// sessions.
+    /// registry, and fire `ringing` for new sustained-active sessions.
+    ///
+    /// We enumerate ALL devices, not just the default, because each
+    /// app attaches its audio session to one specific device. If the
+    /// user has VXT routed through a headset and Spotify through
+    /// speakers, those are sessions on two different devices and
+    /// only the "default" device shows up under
+    /// GetDefaultAudioEndpoint — we'd miss the other.
     fn poll_once(
         enumerator: &IMMDeviceEnumerator,
         state: &mut HashMap<u32, PidState>,
         ctx: &AppContext,
         rt: &tokio::runtime::Handle,
     ) -> windows::core::Result<()> {
-        let device: IMMDevice =
-            unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)? };
+        let device_collection: IMMDeviceCollection = unsafe {
+            enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?
+        };
+        let device_count = unsafe { device_collection.GetCount()? };
 
-        // Activate the per-device session manager. In windows-rs 0.58
-        // the typed wrapper takes 2 args (CLSCTX + optional activation
-        // params) and returns Result<T> — T is inferred from the let
-        // binding's type annotation. No manual out-pointer juggling.
-        let session_mgr: IAudioSessionManager2 =
-            unsafe { device.Activate(CLSCTX_ALL, None)? };
-
-        let sessions: IAudioSessionEnumerator =
-            unsafe { session_mgr.GetSessionEnumerator()? };
-        let count = unsafe { sessions.GetCount()? };
-
-        // Build the set of PIDs that ARE VoIP-matched and currently active.
         let mut active_voip_pids = Vec::new();
-
-        // Diagnostic counter — log a one-liner per poll showing how
-        // many sessions we saw, vs how many were Active, vs how many
-        // matched a VoIP filter. Helps spot the "VXT session isn't
-        // appearing at all" case without scrolling through per-session
-        // debug spam.
         let mut total_seen = 0u32;
         let mut active_seen = 0u32;
 
-        for i in 0..count {
-            total_seen += 1;
-            let session_control = unsafe { sessions.GetSession(i)? };
-            let session2: IAudioSessionControl2 = session_control.cast()?;
-
-            let session_state = unsafe { session_control.GetState()? };
-            // Get PID even for inactive sessions so the debug log
-            // can attribute them. PID may be 0 for system mixer.
-            let pid = unsafe { session2.GetProcessId().unwrap_or(0) };
-
-            // Resolve process name. Best-effort — may return None
-            // for system PID 0 or processes we can't open.
-            let process_name = if pid == 0 {
-                "<system>".to_string()
-            } else {
-                get_process_name(pid).unwrap_or_else(|| format!("<pid-{}>", pid))
+        for di in 0..device_count {
+            let device: IMMDevice = unsafe { device_collection.Item(di)? };
+            // Activate the per-device session manager. Errors here
+            // (e.g. a device that's active but doesn't allow this
+            // role) shouldn't kill the whole poll — log and move on.
+            let session_mgr: IAudioSessionManager2 = match unsafe {
+                device.Activate(CLSCTX_ALL, None)
+            } {
+                Ok(m) => m,
+                Err(err) => {
+                    log::debug!(
+                        "device {} Activate(IAudioSessionManager2) failed: {:?}",
+                        di,
+                        err
+                    );
+                    continue;
+                }
             };
 
-            // Match against VoIP filters BEFORE the active-only gate
-            // so the debug log shows whether VXT (or whatever) is
-            // present at all, even if it's not currently playing.
-            let voip_match = match_voip_process(&process_name);
+            let sessions: IAudioSessionEnumerator =
+                unsafe { session_mgr.GetSessionEnumerator()? };
+            let count = unsafe { sessions.GetCount()? };
 
-            // One debug line per session, every poll. Verbose but
-            // exactly what we need to diagnose the "VXT not detected"
-            // case. Filter at RUST_LOG=debug at runtime.
-            log::debug!(
-                "audio session: pid={} state={:?} process={} voip_match={:?}",
-                pid,
-                session_state,
-                process_name,
-                voip_match
-            );
+            for i in 0..count {
+                total_seen += 1;
+                let session_control = unsafe { sessions.GetSession(i)? };
+                let session2: IAudioSessionControl2 = session_control.cast()?;
 
-            // Apply the actual filtering for the ringing-detection
-            // logic.
-            if session_state != AudioSessionStateActive {
-                continue;
+                let session_state = unsafe { session_control.GetState()? };
+                let pid = unsafe { session2.GetProcessId().unwrap_or(0) };
+
+                let process_name = if pid == 0 {
+                    "<system>".to_string()
+                } else {
+                    get_process_name(pid).unwrap_or_else(|| format!("<pid-{}>", pid))
+                };
+
+                let voip_match = match_voip_process(&process_name);
+
+                log::debug!(
+                    "audio session: device={} pid={} state={:?} process={} voip_match={:?}",
+                    di,
+                    pid,
+                    session_state,
+                    process_name,
+                    voip_match
+                );
+
+                if session_state != AudioSessionStateActive {
+                    continue;
+                }
+                active_seen += 1;
+                if pid == 0 {
+                    continue;
+                }
+                let Some(display_name) = voip_match else {
+                    continue;
+                };
+
+                active_voip_pids.push((pid, process_name, display_name));
             }
-            active_seen += 1;
-            if pid == 0 {
-                continue;
-            }
-            let Some(display_name) = voip_match else {
-                continue;
-            };
-
-            active_voip_pids.push((pid, process_name, display_name));
         }
 
-        // Per-poll summary at INFO level so it shows up even without
-        // RUST_LOG=debug. Capped at one line per 10 polls (5s) to
-        // keep the terminal clean during normal operation.
-        log_poll_summary(total_seen, active_seen, active_voip_pids.len() as u32);
+        // Per-poll summary at INFO level. Now also reports device count.
+        log_poll_summary(
+            device_count,
+            total_seen,
+            active_seen,
+            active_voip_pids.len() as u32,
+        );
 
         // Drive the state machine for each currently-active VoIP PID.
         for (pid, process_name, display_name) in &active_voip_pids {
@@ -290,16 +296,15 @@ mod windows_impl {
     /// Diagnostic helper — print a "poll summary" line every ~5
     /// seconds at INFO level so we can confirm the listener is
     /// alive and see what it's observing without needing to enable
-    /// RUST_LOG=debug. Internal counter resets at usize::MAX.
-    fn log_poll_summary(total: u32, active: u32, voip_active: u32) {
+    /// RUST_LOG=debug.
+    fn log_poll_summary(devices: u32, total: u32, active: u32, voip_active: u32) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        // Every 10th poll (~5s) print a summary line. Plus print
-        // whenever voip_active > 0 since that's the interesting case.
         if n % 10 == 0 || voip_active > 0 {
             log::info!(
-                "audio session poll: {} total, {} active, {} voip-matched",
+                "audio session poll: {} devices, {} sessions total, {} active, {} voip-matched",
+                devices,
                 total,
                 active,
                 voip_active
