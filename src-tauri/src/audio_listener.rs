@@ -384,15 +384,18 @@ mod windows_impl {
                 }
                 Err(e) => log::info!("voip-dump:   GetSessionIdentifier: <err {:?}>", e),
             }
-            // IsSystemSoundsSession returns S_OK if it IS a system-sounds
-            // session, S_FALSE otherwise. windows-rs maps S_FALSE to Err
-            // with the HRESULT, so both branches are informative.
-            match session2.IsSystemSoundsSession() {
-                Ok(()) => log::info!("voip-dump:   IsSystemSoundsSession: yes (S_OK)"),
-                Err(e) => log::info!(
-                    "voip-dump:   IsSystemSoundsSession: no (HRESULT={:?})",
-                    e
-                ),
+            // IsSystemSoundsSession returns raw HRESULT in windows-rs 0.58:
+            // S_OK (0) means yes, S_FALSE (1) means no. We must compare the
+            // numeric code directly because both values map to "non-error"
+            // in HRESULT::is_ok().
+            let hr = session2.IsSystemSoundsSession();
+            if hr.0 == 0 {
+                log::info!("voip-dump:   IsSystemSoundsSession: yes (S_OK)");
+            } else {
+                log::info!(
+                    "voip-dump:   IsSystemSoundsSession: no (HRESULT=0x{:08X})",
+                    hr.0 as u32
+                );
             }
         }
 

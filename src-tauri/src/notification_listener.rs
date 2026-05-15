@@ -92,7 +92,7 @@ mod windows_impl {
     use windows::UI::Notifications::{
         KnownNotificationBindings,
         Management::{UserNotificationListener, UserNotificationListenerAccessStatus},
-        NotificationKinds, ToastNotification, UserNotification,
+        Notification, NotificationKinds, UserNotification,
     };
 
     /// How often we ask the OS for the current toast list. 500ms
@@ -306,16 +306,32 @@ mod windows_impl {
         false
     }
 
-    /// Diagnostic — log everything we can pull off a softphone toast,
-    /// including the raw XML payload. Fires once per VoIP-app
-    /// notification (low volume — typically one per call) and lets us
-    /// see if caller info hides in action buttons, hint attributes,
-    /// custom templates, or other fields the text-only parser skips.
+    /// Diagnostic — log everything we can pull off a softphone
+    /// notification. Fires per VoIP-app notification (rare events,
+    /// typically one per call) so we can see whether caller info
+    /// hides in fields the regular text-only path discards.
     ///
-    /// All errors are absorbed — best-effort visibility.
+    /// The listener side gives us `Notification`, NOT
+    /// `ToastNotification`, so raw toast XML / Tag / Group / Priority
+    /// are not accessible. What we CAN walk:
+    ///
+    ///   Notification.Visual.Bindings → list of NotificationBinding
+    ///     • Template (e.g. "ToastGeneric")
+    ///     • Language
+    ///     • GetTextElements() — each text element separately, with its
+    ///       own Hints
+    ///     • Hints — key/value bag for binding-level hints
+    ///
+    /// We log text elements separately (the regular path concatenates
+    /// them, destroying structure) and dump hint keys at both binding
+    /// and text-element level. If VXT stashes the phone number in a
+    /// hint, a non-first text element, or a non-ToastGeneric binding,
+    /// it shows up here.
+    ///
+    /// All errors absorbed — best-effort visibility.
     fn dump_notification_fully(
         n: &UserNotification,
-        toast: &ToastNotification,
+        notification: &Notification,
         app_id: &str,
     ) {
         log::info!("voip-dump: ── notification from app_id={} ──", app_id);
@@ -324,29 +340,115 @@ mod windows_impl {
             log::info!("voip-dump:   UserNotification.Id: {}", id);
         }
 
-        match toast.Tag() {
-            Ok(s) => log::info!("voip-dump:   ToastNotification.Tag: '{}'", s),
-            Err(e) => log::info!("voip-dump:   ToastNotification.Tag: <err {:?}>", e),
-        }
-        match toast.Group() {
-            Ok(s) => log::info!("voip-dump:   ToastNotification.Group: '{}'", s),
-            Err(e) => log::info!("voip-dump:   ToastNotification.Group: <err {:?}>", e),
-        }
-        match toast.Priority() {
-            Ok(p) => log::info!("voip-dump:   ToastNotification.Priority: {:?}", p),
-            Err(e) => log::info!("voip-dump:   ToastNotification.Priority: <err {:?}>", e),
+        let visual = match notification.Visual() {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("voip-dump:   Visual() failed: {:?}", e);
+                log::info!("voip-dump: ── end notification ──");
+                return;
+            }
+        };
+        if let Ok(lang) = visual.Language() {
+            log::info!("voip-dump:   Visual.Language: '{}'", lang);
         }
 
-        // The big payload — raw toast XML covers every text element,
-        // action button, image, hint, and attribute the publisher set.
-        match toast.Content() {
-            Ok(xml_doc) => match xml_doc.GetXml() {
-                Ok(xml) => log::info!("voip-dump:   raw XML:\n{}", xml),
-                Err(e) => log::warn!("voip-dump:   GetXml() failed: {:?}", e),
-            },
-            Err(e) => log::warn!("voip-dump:   Content() failed: {:?}", e),
+        let bindings = match visual.Bindings() {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("voip-dump:   Bindings() failed: {:?}", e);
+                log::info!("voip-dump: ── end notification ──");
+                return;
+            }
+        };
+        let bcount = bindings.Size().unwrap_or(0);
+        log::info!("voip-dump:   Bindings count: {}", bcount);
+
+        for bi in 0..bcount {
+            let binding = match bindings.GetAt(bi) {
+                Ok(b) => b,
+                Err(e) => {
+                    log::warn!("voip-dump:   binding[{}] error: {:?}", bi, e);
+                    continue;
+                }
+            };
+            if let Ok(t) = binding.Template() {
+                log::info!("voip-dump:   binding[{}].Template: '{}'", bi, t);
+            }
+            if let Ok(l) = binding.Language() {
+                log::info!("voip-dump:   binding[{}].Language: '{}'", bi, l);
+            }
+
+            // Text elements separately — regular path concatenates idx>=1.
+            if let Ok(texts) = binding.GetTextElements() {
+                let tcount = texts.Size().unwrap_or(0);
+                log::info!(
+                    "voip-dump:   binding[{}] text elements: {}",
+                    bi,
+                    tcount
+                );
+                for ti in 0..tcount {
+                    if let Ok(text_el) = texts.GetAt(ti) {
+                        if let Ok(s) = text_el.Text() {
+                            log::info!(
+                                "voip-dump:     text[{}]: '{}'",
+                                ti, s
+                            );
+                        }
+                        // Text-element-level hint keys — sometimes
+                        // contain "call:", "tel:", etc.
+                        if let Ok(thints) = text_el.Hints() {
+                            let keys = collect_hint_keys(&thints);
+                            if !keys.is_empty() {
+                                log::info!(
+                                    "voip-dump:     text[{}] hint keys: {:?}",
+                                    ti, keys
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Binding-level hints — same idea, broader scope.
+            if let Ok(hints) = binding.Hints() {
+                let keys = collect_hint_keys(&hints);
+                if !keys.is_empty() {
+                    log::info!(
+                        "voip-dump:   binding[{}] hint keys: {:?}",
+                        bi, keys
+                    );
+                }
+            }
         }
 
         log::info!("voip-dump: ── end notification ──");
+    }
+
+    /// Collect just the keys of an IPropertySet (the value side is
+    /// IInspectable and needs per-type casting we're not doing here).
+    /// Returns an empty vec on any iteration error.
+    fn collect_hint_keys(
+        hints: &windows::Foundation::Collections::IPropertySet,
+    ) -> Vec<String> {
+        let mut keys = Vec::new();
+        let iter = match hints.First() {
+            Ok(it) => it,
+            Err(_) => return keys,
+        };
+        loop {
+            match iter.HasCurrent() {
+                Ok(true) => {}
+                _ => break,
+            }
+            if let Ok(kvp) = iter.Current() {
+                if let Ok(k) = kvp.Key() {
+                    keys.push(k.to_string());
+                }
+            }
+            if iter.MoveNext().is_err() {
+                break;
+            }
+        }
+        keys
     }
 }
