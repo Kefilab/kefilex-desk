@@ -69,9 +69,10 @@ mod windows_impl {
     use windows::core::Interface;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Media::Audio::{
-        eRender, IAudioSessionControl2, IAudioSessionEnumerator,
-        IAudioSessionManager2, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator,
-        MMDeviceEnumerator, AudioSessionStateActive, DEVICE_STATE_ACTIVE,
+        eCapture, eConsole, eRender, AudioSessionStateActive, IAudioSessionControl2,
+        IAudioSessionEnumerator, IAudioSessionManager2, IMMDevice, IMMDeviceCollection,
+        IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+        DEVICE_STATE_DISABLED, DEVICE_STATE_NOTPRESENT, DEVICE_STATE_UNPLUGGED,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_ALL, CLSCTX_INPROC_SERVER,
@@ -139,6 +140,17 @@ mod windows_impl {
             "audio session listener: polling every {:?}",
             POLL_INTERVAL
         );
+
+        // One-shot diagnostic at startup: dump every audio endpoint
+        // Windows knows about, in every state (Active / Disabled /
+        // NotPresent / Unplugged), for both render and capture. This
+        // helps us understand why session enumeration on a given
+        // laptop only turns up the system PID-0 session — either
+        // because devices we'd expect are Disabled/NotPresent, or
+        // because the user's audio stack is doing something unusual
+        // (per-app routing via virtual cables, MS Teams device
+        // hijacking, headset switching, etc).
+        log_audio_config_once(&device_enumerator);
 
         let mut state: HashMap<u32, PidState> = HashMap::new();
 
@@ -291,6 +303,97 @@ mod windows_impl {
         }
 
         Ok(())
+    }
+
+    /// One-shot startup diagnostic. Walks every audio endpoint in
+    /// every state, both render and capture, and logs id + dataflow
+    /// + state. Also logs the default render device id (eConsole role)
+    /// so we can cross-reference what Windows considers "the system's
+    /// default speakers".
+    ///
+    /// All errors are absorbed — this is best-effort visibility, never
+    /// blocks the polling loop.
+    fn log_audio_config_once(enumerator: &IMMDeviceEnumerator) {
+        log::info!("audio-config: ── start one-shot endpoint dump ──");
+
+        for (flow, flow_name) in [
+            (eRender, "render"),
+            (eCapture, "capture"),
+        ] {
+            for (state_const, state_name) in [
+                (DEVICE_STATE_ACTIVE, "ACTIVE"),
+                (DEVICE_STATE_DISABLED, "DISABLED"),
+                (DEVICE_STATE_NOTPRESENT, "NOTPRESENT"),
+                (DEVICE_STATE_UNPLUGGED, "UNPLUGGED"),
+            ] {
+                let coll: IMMDeviceCollection = match unsafe {
+                    enumerator.EnumAudioEndpoints(flow, state_const)
+                } {
+                    Ok(c) => c,
+                    Err(err) => {
+                        log::warn!(
+                            "audio-config: EnumAudioEndpoints({}, {}) failed: {:?}",
+                            flow_name,
+                            state_name,
+                            err
+                        );
+                        continue;
+                    }
+                };
+                let count = unsafe { coll.GetCount() }.unwrap_or(0);
+                log::info!(
+                    "audio-config: {} {} devices: {}",
+                    flow_name,
+                    state_name,
+                    count
+                );
+                for i in 0..count {
+                    let device = match unsafe { coll.Item(i) } {
+                        Ok(d) => d,
+                        Err(err) => {
+                            log::warn!(
+                                "audio-config: {} {} #{} Item() failed: {:?}",
+                                flow_name,
+                                state_name,
+                                i,
+                                err
+                            );
+                            continue;
+                        }
+                    };
+                    let id_str = unsafe { device.GetId() }
+                        .ok()
+                        .and_then(|p| unsafe { p.to_string() }.ok())
+                        .unwrap_or_else(|| "<no-id>".to_string());
+                    log::info!(
+                        "audio-config: {} {} #{}: id={}",
+                        flow_name,
+                        state_name,
+                        i,
+                        id_str
+                    );
+                }
+            }
+        }
+
+        // Default endpoint sanity check. If this returns something
+        // and EnumAudioEndpoints(eRender, ACTIVE) doesn't contain it,
+        // we've got a serious mismatch.
+        match unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) } {
+            Ok(d) => {
+                let id_str = unsafe { d.GetId() }
+                    .ok()
+                    .and_then(|p| unsafe { p.to_string() }.ok())
+                    .unwrap_or_else(|| "<no-id>".to_string());
+                log::info!("audio-config: default render (console) id={}", id_str);
+            }
+            Err(err) => log::warn!(
+                "audio-config: GetDefaultAudioEndpoint(render, console) failed: {:?}",
+                err
+            ),
+        }
+
+        log::info!("audio-config: ── end endpoint dump ──");
     }
 
     /// Diagnostic helper — print a "poll summary" line every ~5
