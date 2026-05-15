@@ -59,15 +59,17 @@ pub fn run_blocking(ctx: AppContext, rt: tokio::runtime::Handle) {
 }
 
 /// Build a CallEvent for the Kefilex API from a matched notification.
-/// Pulled out so future call sites (manual test trigger, e.g.) can
-/// reuse the shape without duplicating fields.
+/// The `event_type` (ringing / missed / voicemail / etc.) comes from
+/// the matched filter rule — different softphones report different
+/// lifecycle moments and we want each to map to the right calls
+/// table status on the server side.
 pub fn build_call_event(
     filter_match: &crate::voip_filters::FilterMatch,
     notification_text: &str,
 ) -> api::CallEvent<'static> {
     let now = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     api::CallEvent {
-        event_type: "ringing",
+        event_type: filter_match.event_type,
         caller_phone_e164: filter_match.caller_phone_e164.clone(),
         firm_phone_e164: None,
         source_app: Some(filter_match.source_app.to_string()),
