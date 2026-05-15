@@ -68,7 +68,15 @@ pub const BUILTIN_FILTERS: &[VoipFilter] = &[
     VoipFilter {
         display_name: "VXT",
         app_id_patterns: &["vxt"],
-        text_pattern: r"(?i)Missed call from\s+(?:(?P<phone>\+?[\d\s().-]{6,30})|(?P<name>[^\n]+?))$",
+        // Real-world observation: VXT desktop's missed-call toast
+        // has empty body, so the combined string we match against is
+        // "Missed call from Bal | " (with the join separator trailing).
+        // The name capture used to greedily slurp up to "$" which
+        // included the " — " separator and trailing whitespace,
+        // producing "Bal —" instead of "Bal". The non-greedy character
+        // class below stops at separator characters, whitespace, or
+        // pipe so we capture just the name.
+        text_pattern: r"(?i)Missed call from\s+(?:(?P<phone>\+?[\d\s().-]{6,30})|(?P<name>[^\s|—–-][^|—–\n]*?))(?:\s*[—–|\-]|\s*$)",
         event_type: "missed",
     },
     // Voicemail notification from VXT — separate filter entry so the
@@ -258,6 +266,26 @@ mod tests {
         assert_eq!(m.event_type, "missed");
         assert_eq!(m.caller_display_name.as_deref(), Some("Bal"));
         assert!(m.caller_phone_e164.is_none());
+    }
+
+    #[test]
+    fn vxt_missed_call_with_empty_body() {
+        // Real-world: VXT puts the message in the title and leaves
+        // the body empty. The "{title} — {body}" join produces
+        // "Missed call from Bal — " with trailing whitespace and a
+        // dangling em-dash. Name capture must not slurp the em-dash.
+        let m = match_notification(
+            "nz.co.vxt.electron",
+            "Missed call from Bal",
+            "",
+        );
+        let m = m.expect("should match");
+        assert_eq!(m.event_type, "missed");
+        assert_eq!(
+            m.caller_display_name.as_deref(),
+            Some("Bal"),
+            "name should not include trailing separator"
+        );
     }
 
     #[test]
