@@ -113,18 +113,34 @@ pub fn run() {
             // worker threads it spawns. The async task is cheap: it
             // does one std::thread::spawn then exits, while the OS
             // thread it spawned inherits the Tokio handle.
-            let ctx_for_nl = ctx.clone();
-            tauri::async_runtime::spawn(async move {
-                let rt = tokio::runtime::Handle::current();
-                if let Err(err) = std::thread::Builder::new()
-                    .name("kefilex-desk-notif".into())
-                    .spawn(move || {
-                        notification_listener::run_blocking(ctx_for_nl, rt);
-                    })
-                {
-                    log::error!("failed to spawn notification listener thread: {}", err);
-                }
-            });
+            //
+            // Emergency disable: set KEFILEX_DESK_DISABLE_NOTIFICATION_LISTENER
+            // to any value to skip spawning. Useful if a specific
+            // softphone toast pattern is causing crashes or wrong
+            // matches in production and the user needs to keep the
+            // companion running until we ship a fix.
+            if std::env::var("KEFILEX_DESK_DISABLE_NOTIFICATION_LISTENER").is_ok() {
+                log::warn!(
+                    "notification listener disabled via \
+                     KEFILEX_DESK_DISABLE_NOTIFICATION_LISTENER env var"
+                );
+            } else {
+                let ctx_for_nl = ctx.clone();
+                tauri::async_runtime::spawn(async move {
+                    let rt = tokio::runtime::Handle::current();
+                    if let Err(err) = std::thread::Builder::new()
+                        .name("kefilex-desk-notif".into())
+                        .spawn(move || {
+                            notification_listener::run_blocking(ctx_for_nl, rt);
+                        })
+                    {
+                        log::error!(
+                            "failed to spawn notification listener thread: {}",
+                            err
+                        );
+                    }
+                });
+            }
 
             // CoreAudio session listener — fires "ringing" events
             // when ANY softphone process starts playing audio (i.e.
@@ -134,18 +150,34 @@ pub fn run() {
             // notification listener: COM objects aren't Send, so we
             // give it its own OS thread + Tokio handle for the
             // HTTP push.
-            let ctx_for_al = ctx.clone();
-            tauri::async_runtime::spawn(async move {
-                let rt = tokio::runtime::Handle::current();
-                if let Err(err) = std::thread::Builder::new()
-                    .name("kefilex-desk-audio".into())
-                    .spawn(move || {
-                        audio_listener::run_blocking(ctx_for_al, rt);
-                    })
-                {
-                    log::error!("failed to spawn audio session listener thread: {}", err);
-                }
-            });
+            //
+            // Emergency disable: set KEFILEX_DESK_DISABLE_AUDIO_LISTENER
+            // to any value to skip spawning. Useful if false-positive
+            // ringing events (e.g. outbound calls) are flooding
+            // reception's banner and we need to drop back to
+            // notification-only capture pending a fix.
+            if std::env::var("KEFILEX_DESK_DISABLE_AUDIO_LISTENER").is_ok() {
+                log::warn!(
+                    "audio listener disabled via \
+                     KEFILEX_DESK_DISABLE_AUDIO_LISTENER env var"
+                );
+            } else {
+                let ctx_for_al = ctx.clone();
+                tauri::async_runtime::spawn(async move {
+                    let rt = tokio::runtime::Handle::current();
+                    if let Err(err) = std::thread::Builder::new()
+                        .name("kefilex-desk-audio".into())
+                        .spawn(move || {
+                            audio_listener::run_blocking(ctx_for_al, rt);
+                        })
+                    {
+                        log::error!(
+                            "failed to spawn audio session listener thread: {}",
+                            err
+                        );
+                    }
+                });
+            }
 
             // First-launch UX: if there's no pairing token, pop the
             // window immediately so the user enters the 6-digit code.

@@ -112,16 +112,37 @@ pub const BUILTIN_FILTERS: &[VoipFilter] = &[
     },
 
     // ─── Aircall ──────────────────────────────────────────────────
+    // Three filters per event type, ordered specific → general so that
+    // when the toast carries BOTH name AND phone we capture both. The
+    // fallback alternation catches name-only or phone-only toasts.
+    //
+    // Observed Aircall formats (from public docs / screenshots, not
+    // verified end-to-end yet):
+    //   "Incoming call from John Smith • +33 1 23 45 67 89"
+    //   "Incoming call from +33 1 23 45 67 89"        (unknown caller)
+    //   "Incoming call from John Smith"               (anonymous)
     VoipFilter {
         display_name: "Aircall",
         app_id_patterns: &["aircall", "com.aircall.desktop"],
-        text_pattern: r"(?i)incoming call.*?(?P<phone>\+?[\d\s().-]{6,30})",
+        text_pattern: r"(?i)incoming call from\s+(?P<name>[^•—–\n]+?)\s*[•—–\-]\s*(?P<phone>\+?[\d\s().-]{6,30})\s*$",
         event_type: "ringing",
     },
     VoipFilter {
         display_name: "Aircall",
         app_id_patterns: &["aircall", "com.aircall.desktop"],
-        text_pattern: r"(?i)missed call.*?(?P<phone>\+?[\d\s().-]{6,30})",
+        text_pattern: r"(?i)incoming call from\s+(?:(?P<phone>\+?[\d\s().-]{6,30})|(?P<name>[^\n]+?))\s*$",
+        event_type: "ringing",
+    },
+    VoipFilter {
+        display_name: "Aircall",
+        app_id_patterns: &["aircall", "com.aircall.desktop"],
+        text_pattern: r"(?i)missed call from\s+(?P<name>[^•—–\n]+?)\s*[•—–\-]\s*(?P<phone>\+?[\d\s().-]{6,30})\s*$",
+        event_type: "missed",
+    },
+    VoipFilter {
+        display_name: "Aircall",
+        app_id_patterns: &["aircall", "com.aircall.desktop"],
+        text_pattern: r"(?i)missed call from\s+(?:(?P<phone>\+?[\d\s().-]{6,30})|(?P<name>[^\n]+?))\s*$",
         event_type: "missed",
     },
 
@@ -152,11 +173,31 @@ pub const BUILTIN_FILTERS: &[VoipFilter] = &[
     },
 
     // ─── 8x8 ──────────────────────────────────────────────────────
+    // Same specific → general structure as Aircall — try to capture
+    // both name and phone when present, fall back to either-or.
     VoipFilter {
         display_name: "8x8",
         app_id_patterns: &["8x8", "com.8x8.work"],
-        text_pattern: r"(?i)incoming call.*?(?P<phone>\+?[\d\s().-]{6,30})",
+        text_pattern: r"(?i)incoming call from\s+(?P<name>[^•—–\n]+?)\s*[•—–\-]\s*(?P<phone>\+?[\d\s().-]{6,30})\s*$",
         event_type: "ringing",
+    },
+    VoipFilter {
+        display_name: "8x8",
+        app_id_patterns: &["8x8", "com.8x8.work"],
+        text_pattern: r"(?i)incoming call from\s+(?:(?P<phone>\+?[\d\s().-]{6,30})|(?P<name>[^\n]+?))\s*$",
+        event_type: "ringing",
+    },
+    VoipFilter {
+        display_name: "8x8",
+        app_id_patterns: &["8x8", "com.8x8.work"],
+        text_pattern: r"(?i)missed call from\s+(?P<name>[^•—–\n]+?)\s*[•—–\-]\s*(?P<phone>\+?[\d\s().-]{6,30})\s*$",
+        event_type: "missed",
+    },
+    VoipFilter {
+        display_name: "8x8",
+        app_id_patterns: &["8x8", "com.8x8.work"],
+        text_pattern: r"(?i)missed call from\s+(?:(?P<phone>\+?[\d\s().-]{6,30})|(?P<name>[^\n]+?))\s*$",
+        event_type: "missed",
     },
 
     // ─── Cisco Webex Calling ──────────────────────────────────────
@@ -325,6 +366,46 @@ mod tests {
         assert_eq!(m.source_app, "Microsoft Teams");
         assert_eq!(m.event_type, "ringing");
         assert_eq!(m.caller_display_name.as_deref(), Some("Jane Smith"));
+    }
+
+    #[test]
+    fn aircall_incoming_with_name_and_phone() {
+        let m = match_notification(
+            "com.aircall.desktop",
+            "Aircall",
+            "Incoming call from Jane Smith • +33 1 23 45 67 89",
+        );
+        let m = m.expect("should match");
+        assert_eq!(m.source_app, "Aircall");
+        assert_eq!(m.event_type, "ringing");
+        assert_eq!(m.caller_display_name.as_deref(), Some("Jane Smith"));
+        assert_eq!(m.caller_phone_e164.as_deref(), Some("+33123456789"));
+    }
+
+    #[test]
+    fn aircall_incoming_phone_only() {
+        let m = match_notification(
+            "com.aircall.desktop",
+            "Aircall",
+            "Incoming call from +44 7700 900101",
+        );
+        let m = m.expect("should match");
+        assert_eq!(m.event_type, "ringing");
+        assert_eq!(m.caller_phone_e164.as_deref(), Some("+447700900101"));
+    }
+
+    #[test]
+    fn eight_by_eight_incoming_with_name_and_phone() {
+        let m = match_notification(
+            "com.8x8.work",
+            "8x8 Work",
+            "Incoming call from John Doe • +44 20 7946 0958",
+        );
+        let m = m.expect("should match");
+        assert_eq!(m.source_app, "8x8");
+        assert_eq!(m.event_type, "ringing");
+        assert_eq!(m.caller_display_name.as_deref(), Some("John Doe"));
+        assert_eq!(m.caller_phone_e164.as_deref(), Some("+442079460958"));
     }
 
     #[test]
