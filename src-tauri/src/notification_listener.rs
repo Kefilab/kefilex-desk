@@ -394,14 +394,15 @@ mod windows_impl {
                                 ti, s
                             );
                         }
-                        // Text-element-level hint keys — sometimes
-                        // contain "call:", "tel:", etc.
+                        // Text-element-level hints — string-to-string
+                        // map. May contain hint-style="caller" or
+                        // similar, occasionally caller-info attrs.
                         if let Ok(thints) = text_el.Hints() {
-                            let keys = collect_hint_keys(&thints);
-                            if !keys.is_empty() {
+                            let pairs = collect_hint_pairs(&thints);
+                            if !pairs.is_empty() {
                                 log::info!(
-                                    "voip-dump:     text[{}] hint keys: {:?}",
-                                    ti, keys
+                                    "voip-dump:     text[{}] hints: {:?}",
+                                    ti, pairs
                                 );
                             }
                         }
@@ -411,11 +412,11 @@ mod windows_impl {
 
             // Binding-level hints — same idea, broader scope.
             if let Ok(hints) = binding.Hints() {
-                let keys = collect_hint_keys(&hints);
-                if !keys.is_empty() {
+                let pairs = collect_hint_pairs(&hints);
+                if !pairs.is_empty() {
                     log::info!(
-                        "voip-dump:   binding[{}] hint keys: {:?}",
-                        bi, keys
+                        "voip-dump:   binding[{}] hints: {:?}",
+                        bi, pairs
                     );
                 }
             }
@@ -424,16 +425,21 @@ mod windows_impl {
         log::info!("voip-dump: ── end notification ──");
     }
 
-    /// Collect just the keys of an IPropertySet (the value side is
-    /// IInspectable and needs per-type casting we're not doing here).
-    /// Returns an empty vec on any iteration error.
-    fn collect_hint_keys(
-        hints: &windows::Foundation::Collections::IPropertySet,
-    ) -> Vec<String> {
-        let mut keys = Vec::new();
+    /// Collect every (key, value) pair from a NotificationBinding /
+    /// AdaptiveNotificationText Hints map. Both keys and values are
+    /// HSTRING in windows-rs 0.58 — i.e. plain strings — so we can
+    /// surface the full payload without needing per-type IInspectable
+    /// casting. Returns an empty vec on any iteration error.
+    fn collect_hint_pairs(
+        hints: &windows::Foundation::Collections::IMap<
+            windows::core::HSTRING,
+            windows::core::HSTRING,
+        >,
+    ) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
         let iter = match hints.First() {
             Ok(it) => it,
-            Err(_) => return keys,
+            Err(_) => return pairs,
         };
         loop {
             match iter.HasCurrent() {
@@ -441,14 +447,14 @@ mod windows_impl {
                 _ => break,
             }
             if let Ok(kvp) = iter.Current() {
-                if let Ok(k) = kvp.Key() {
-                    keys.push(k.to_string());
-                }
+                let k = kvp.Key().map(|h| h.to_string()).unwrap_or_default();
+                let v = kvp.Value().map(|h| h.to_string()).unwrap_or_default();
+                pairs.push((k, v));
             }
             if iter.MoveNext().is_err() {
                 break;
             }
         }
-        keys
+        pairs
     }
 }
